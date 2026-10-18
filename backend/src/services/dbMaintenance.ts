@@ -27,6 +27,7 @@ import path from "path";
 import fs from "fs";
 import { createLogger } from "../utils/logger";
 import type Database from "better-sqlite3";
+import { encryptBackupFile, ENCRYPTED_BACKUP_SUFFIX } from "./backup/encryption";
 
 const logger = createLogger({ component: "db-maintenance" });
 
@@ -229,24 +230,35 @@ export class DbMaintenanceService {
 
   /**
    * Take a consistent snapshot of a live database using SQLite's online backup
-   * API. Each snapshot is timestamped and prefixed with the database name so
-   * retention can identify siblings.
+   * API, then encrypt it at rest (Issue #747). Each snapshot is timestamped
+   * and prefixed with the database name so retention can identify siblings.
+   *
+   * Fails closed: when `DB_BACKUP_ENCRYPTION_KEY` is unset the raw snapshot
+   * is never left on disk — `encryptBackupFile` throws before writing one.
    */
   private async createBackup(db: MaintenanceDb): Promise<string> {
     const rawPath = path.join(this.backupDir, `${db.name}-${Date.now()}.db`);
     const connection = db.getConnection();
     await connection.backup(rawPath);
-    return rawPath;
+    return encryptBackupFile(rawPath, { source: db.name });
   }
 
   /**
    * Trim a database's snapshots down to the retention count, deleting oldest
-   * first. Returns how many files were removed.
+   * first. Plain `.db` and encrypted `.db.enc` snapshots share one budget, so
+   * turning encryption on cannot double the on-disk footprint. Returns how
+   * many files were removed.
    */
   private applyRetention(dbName: string): number {
     let files: string[] = [];
     try {
-      files = fs.readdirSync(this.backupDir).filter((f) => f.startsWith(`${dbName}-`) && f.endsWith(".db"));
+      files = fs
+        .readdirSync(this.backupDir)
+        .filter(
+          (f) =>
+            f.startsWith(`${dbName}-`) &&
+            (f.endsWith(".db") || f.endsWith(ENCRYPTED_BACKUP_SUFFIX)),
+        );
     } catch {
       return 0;
     }
@@ -259,6 +271,10 @@ export class DbMaintenanceService {
       try {
         fs.unlinkSync(path.join(this.backupDir, file));
         deleted += 1;
+        logger.info(
+          { database: dbName, file, retention: this.backupRetentionCount },
+          "pruned expired backup",
+        );
       } catch (error) {
         logger.error({ err: error, database: dbName, file }, "failed to prune backup");
       }

@@ -50,6 +50,8 @@ export type DAGEventType =
   | "payment_released"
   | "task_completed"
   | "task_failed"
+  /** A job exhausted its retry budget and was parked in the DLQ (issue #802). */
+  | "job.dead_lettered"
   | "AgentFailedOver"
   | "AgentRecovered"
   | "AgentMarkedOffline";

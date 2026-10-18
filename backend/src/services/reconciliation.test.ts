@@ -972,7 +972,7 @@ describe("ReconciliationService events and metrics", () => {
 
 // ─── Scheduling ───────────────────────────────────────────────────────────────
 
-describe("ReconciliationService.start / startFrequent", () => {
+describe("ReconciliationService.start", () => {
   beforeEach(() => {
     jest.useFakeTimers();
   });
@@ -1013,7 +1013,7 @@ describe("ReconciliationService.start / startFrequent", () => {
     });
     const runSpy = jest.spyOn(service, "run").mockResolvedValue(consistentReport());
 
-    service.startFrequent(300_000);
+    service.start(300_000);
 
     jest.advanceTimersByTime(300_000);
     await Promise.resolve();
@@ -1071,7 +1071,7 @@ describe("ReconciliationService.start / startFrequent", () => {
       onChainProvider: makeOnChainProvider([]),
       reportStore: makeReportStore().store,
     });
-    service.startFrequent(300_000);
+    service.start(300_000);
     service.stop();
 
     expect((service as unknown as { timer: NodeJS.Timeout | null }).timer).toBeNull();

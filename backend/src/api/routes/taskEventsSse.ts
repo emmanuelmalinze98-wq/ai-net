@@ -118,6 +118,9 @@ export function createTaskEventsSseHandler(options: TaskEventsSseOptions): Reque
       res.flushHeaders();
 
       let closed = false;
+      // Assigned after `cleanup` is defined so an early close can call it;
+      // `const` would put the reference in the temporal dead zone.
+      // eslint-disable-next-line prefer-const
       let unsubscribe: (() => void) | undefined;
       const heartbeat = setInterval(() => {
         if (!closed) res.write(": keep-alive\n\n");

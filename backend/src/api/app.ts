@@ -314,10 +314,49 @@ export function createApp(opts: AppOptions = {}): {
     createAgentWatchdogRouter({ tick: () => watchdog.tick() }),
   );
 
+  /**
+   * @openapi
+   * /openapi.json:
+   *   get:
+   *     summary: Machine-readable OpenAPI specification (JSON)
+   *     operationId: getOpenapiJson
+   *     description: >
+   *       Serves the same OpenAPI 3.1.0 document that backs /api-docs, in
+   *       JSON form, for codegen and client tooling. Public: the spec is not
+   *       operational data, so it opts out of the spec-wide WalletAuth default.
+   *     tags: [System]
+   *     security: []
+   *     responses:
+   *       200:
+   *         description: OpenAPI 3.1.0 specification
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   */
   app.get("/openapi.json", (_req: Request, res: Response) => {
     res.json(getOpenapiJson());
   });
 
+  /**
+   * @openapi
+   * /openapi.yaml:
+   *   get:
+   *     summary: Machine-readable OpenAPI specification (YAML)
+   *     operationId: getOpenapiYaml
+   *     description: >
+   *       The OpenAPI 3.1.0 document in YAML form. Semantically equivalent to
+   *       `GET /openapi.json`. Public: opts out of the spec-wide WalletAuth default.
+   *     tags: [System]
+   *     security: []
+   *     responses:
+   *       200:
+   *         description: OpenAPI 3.1.0 specification (YAML)
+   *         content:
+   *           text/yaml:
+   *             schema:
+   *               type: string
+   */
   app.get("/openapi.yaml", (_req: Request, res: Response) => {
     res.type("text/yaml").send(getOpenapiYaml());
   });

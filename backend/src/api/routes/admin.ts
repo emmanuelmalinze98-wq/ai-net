@@ -551,7 +551,7 @@ export function createAdminRouter(options: AdminRouterOptions = {}): Router {
    *         description: Maximum number of entries to export
    *     responses:
    *       200:
-   *         description: Streamed audit log (`{ "entries": [...] }` for JSON, or CSV)
+   *         description: 'Streamed audit log (JSON `{ "entries": [...] }` or CSV text)'
    *       400:
    *         description: Invalid query parameters
    *         content:
@@ -1114,6 +1114,296 @@ export function createAdminQueueRouter(queue?: JobQueue): Router {
 
     res.json({ success: true, message: `Job ${jobId} moved to pending for retry` });
   });
+
+  /**
+   * @openapi
+   * /api/admin/queue/dlq:
+   *   get:
+   *     summary: List dead-letter queue entries (issue #802)
+   *     description: >
+   *       Paginated inspection of jobs that exhausted their retry budget and
+   *       were isolated in the dead-letter queue. Entries include the failure
+   *       reason, retry count and the original payload for triage.
+   *     operationId: getAdminQueueDlq
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: query
+   *         name: page
+   *         schema: { type: integer, default: 1 }
+   *       - in: query
+   *         name: pageSize
+   *         schema: { type: integer, default: 50 }
+   *     responses:
+   *       200:
+   *         description: Paginated dead-letter entries
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 jobs:
+   *                   type: array
+   *                   items:
+   *                     $ref: '#/components/schemas/DeadLetterEntry'
+   *                 total: { type: integer }
+   *                 page: { type: integer }
+   *                 pageSize: { type: integer }
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   *   delete:
+   *     summary: Purge dead-letter entries older than N days (issue #802)
+   *     description: >
+   *       Deletes dead-letter entries whose failure occurred before the given
+   *       age threshold. `days=0` (the default) purges the whole queue. Every
+   *       purge is written to the admin audit log and returns the number of
+   *       records removed.
+   *     operationId: deleteAdminQueueDlq
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: query
+   *         name: days
+   *         schema: { type: integer, minimum: 0, default: 0 }
+   *         description: Only purge entries whose failure is older than this many days
+   *     responses:
+   *       200:
+   *         description: Number of dead-letter records purged
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 success: { type: boolean, example: true }
+   *                 purged: { type: integer, example: 3 }
+   *                 count: { type: integer, example: 3 }
+   *                 days: { type: integer, example: 30 }
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   */
+  router.get("/dlq", (req: Request, res: Response, next: NextFunction) => {
+    const parsed = jobListQuerySchema
+      .pick({ page: true, pageSize: true })
+      .safeParse(req.query);
+    if (!parsed.success) {
+      next(new ValidationError(
+        "Invalid query parameters",
+        { issues: parsed.error.flatten() },
+        res.locals.correlationId as string | undefined,
+      ));
+      return;
+    }
+
+    const { page, pageSize } = parsed.data;
+    res.json(jobQueue.getDeadLetterQueue().list({ page, pageSize }));
+  });
+
+  router.delete("/dlq", (req: Request, res: Response, next: NextFunction) => {
+    const parsed = z
+      .object({ days: z.coerce.number().int().min(0).max(36_500).default(0) })
+      .safeParse(req.query);
+    if (!parsed.success) {
+      next(new ValidationError(
+        "Invalid query parameters",
+        { issues: parsed.error.flatten() },
+        res.locals.correlationId as string | undefined,
+      ));
+      return;
+    }
+
+    const { days } = parsed.data;
+    const purged = jobQueue.purgeDeadLetters(days);
+    recordAdminAudit({
+      at: new Date().toISOString(),
+      actor: actorFromRequest(req),
+      action: "queue.dlq.purge",
+      statusCode: 200,
+      requestId:
+        (res.locals.requestId as string | undefined) ??
+        (res.locals.correlationId as string | undefined),
+      details: { days, purged },
+    });
+    res.json({ success: true, purged, count: purged, days });
+  });
+
+  /**
+   * @openapi
+   * /api/admin/queue/dlq/{jobId}/replay:
+   *   post:
+   *     summary: Replay a dead-letter entry (issue #802)
+   *     description: >
+   *       Re-enqueues a parked job with a fresh retry counter so it can be
+   *       processed again. The operation is idempotent: replaying a job that
+   *       is no longer parked returns 404 instead of double-enqueueing it.
+   *     operationId: postAdminQueueDlqReplay
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: path
+   *         name: jobId
+   *         required: true
+   *         schema: { type: string }
+   *         description: Dead-letter job ID to replay
+   *         example: "job_98fe76dc54ba"
+   *     responses:
+   *       202:
+   *         description: Job accepted back onto the queue with a fresh retry budget
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 success: { type: boolean, example: true }
+   *                 status: { type: string, enum: [requeued], example: requeued }
+   *                 jobId: { type: string, example: job_98fe76dc54ba }
+   *                 message: { type: string, example: "Dead-letter job job_98fe76dc54ba replayed" }
+   *       404:
+   *         description: Job not found or not in dead-letter status
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   */
+  router.post("/dlq/:jobId/replay", (req: Request, res: Response) => {
+    const jobId = req.params.jobId;
+    const requeued = jobQueue.getDeadLetterQueue().replay(jobId);
+
+    if (!requeued) {
+      res.status(404).json({
+        error: `Dead-letter job ${jobId} not found or not in dead-letter status`,
+      });
+      return;
+    }
+
+    recordAdminAudit({
+      at: new Date().toISOString(),
+      actor: actorFromRequest(req),
+      action: "queue.dlq.replay",
+      target: jobId,
+      statusCode: 202,
+      requestId:
+        (res.locals.requestId as string | undefined) ??
+        (res.locals.correlationId as string | undefined),
+      details: { jobId },
+    });
+    res.status(202).json({
+      success: true,
+      status: "requeued",
+      jobId,
+      message: `Dead-letter job ${jobId} replayed`,
+    });
+  });
+
+  /**
+   * Admin-root aliases of the `/api/admin/queue/dlq*` routes (issue #802).
+   * The queue router is mounted once at `/api/admin/queue` and once at the
+   * admin root, so every operation is reachable — and must be documented —
+   * under both prefixes.
+   *
+   * @openapi
+   * /api/admin/dlq:
+   *   get:
+   *     summary: List dead-letter queue entries (admin-root alias)
+   *     description: Alias of `GET /api/admin/queue/dlq` reached at the admin root.
+   *     operationId: getAdminRootDlq
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: query
+   *         name: page
+   *         schema: { type: integer, default: 1 }
+   *       - in: query
+   *         name: pageSize
+   *         schema: { type: integer, default: 50 }
+   *     responses:
+   *       200:
+   *         description: Paginated dead-letter entries
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 jobs:
+   *                   type: array
+   *                   items:
+   *                     $ref: '#/components/schemas/DeadLetterEntry'
+   *                 total: { type: integer }
+   *                 page: { type: integer }
+   *                 pageSize: { type: integer }
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   *   delete:
+   *     summary: Purge dead-letter entries older than N days (admin-root alias)
+   *     description: Alias of `DELETE /api/admin/queue/dlq` reached at the admin root.
+   *     operationId: deleteAdminRootDlq
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: query
+   *         name: days
+   *         schema: { type: integer, minimum: 0, default: 0 }
+   *         description: Only purge entries whose failure is older than this many days
+   *     responses:
+   *       200:
+   *         description: Number of dead-letter records purged
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 success: { type: boolean, example: true }
+   *                 purged: { type: integer, example: 3 }
+   *                 count: { type: integer, example: 3 }
+   *                 days: { type: integer, example: 30 }
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   * /api/admin/dlq/{jobId}/replay:
+   *   post:
+   *     summary: Replay a dead-letter entry (admin-root alias)
+   *     description: Alias of `POST /api/admin/queue/dlq/{jobId}/replay` reached at the admin root.
+   *     operationId: postAdminRootDlqReplay
+   *     tags: [Admin]
+   *     security:
+   *       - adminApiKey: []
+   *     parameters:
+   *       - in: path
+   *         name: jobId
+   *         required: true
+   *         schema: { type: string }
+   *         description: Dead-letter job ID to replay
+   *         example: "job_98fe76dc54ba"
+   *     responses:
+   *       202:
+   *         description: Job accepted back onto the queue with a fresh retry budget
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 success: { type: boolean, example: true }
+   *                 status: { type: string, enum: [requeued], example: requeued }
+   *                 jobId: { type: string, example: job_98fe76dc54ba }
+   *                 message: { type: string, example: "Dead-letter job job_98fe76dc54ba replayed" }
+   *       404:
+   *         description: Job not found or not in dead-letter status
+   *       401:
+   *         description: Missing or invalid admin API key
+   *       503:
+   *         description: ADMIN_API_KEY is not configured
+   */
 
   return router;
 }

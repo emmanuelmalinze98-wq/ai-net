@@ -143,6 +143,7 @@ function collectQueueMetrics(): string {
     let processing = 0;
     let completed = 0;
     let failed = 0;
+    let deadLetter = 0;
 
     for (const row of rows) {
       const count = Number(row.count) || 0;
@@ -151,11 +152,13 @@ function collectQueueMetrics(): string {
         case 'processing': processing = count; break;
         case 'completed': completed = count; break;
         case 'failed': failed = count; break;
+        case 'dead-letter': deadLetter = count; break;
       }
     }
 
     out += formatGauge('ainet_queue_pending', 'Pending jobs in queue', pending);
     out += formatGauge('ainet_queue_processing', 'Currently processing jobs', processing);
+    out += formatGauge('ainet_queue_dlq_depth', 'Jobs parked in the dead-letter queue awaiting replay or purge', deadLetter);
     out += formatCounter('ainet_queue_completed_total', 'Total completed jobs', completed);
     out += formatCounter('ainet_queue_failed_total', 'Total failed jobs', failed);
 

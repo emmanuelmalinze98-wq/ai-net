@@ -107,6 +107,30 @@ const envSchema = z.object({
   RATE_LIMIT_ADMIN_MAX_REQUESTS: z.coerce.number().int().positive().default(20),
   DAILY_TASK_LIMIT_PER_WALLET: z.coerce.number().int().min(0).default(100),
 
+  // ── Per-wallet abuse-control quota (issue #803) ─────────────────────────────
+  /**
+   * Maximum task submissions a single wallet may have *accepted* in the
+   * trailing 24 hours. The 51st submission is rejected with 429 QUOTA_EXCEEDED.
+   * `0` disables the submission count check (token limits still apply).
+   */
+  MAX_DAILY_TASKS_PER_WALLET: z.coerce.number().int().min(0).default(50),
+  /**
+   * Maximum estimated Venice tokens a single wallet may consume in the
+   * trailing 24 hours (approximated as `ceil(chars / 4)` at submit time).
+   * `0` disables the token budget check.
+   */
+  MAX_DAILY_VENICE_TOKENS_PER_WALLET: z.coerce.number().int().min(0).default(100_000),
+  /**
+   * Hard prompt-length ceiling enforced by the quota layer before a request
+   * reaches the handler. When unset, `MAX_PROMPT_LENGTH` is used so the quota
+   * check and the legacy schema validation agree on one boundary.
+   * (An empty value in `.env` means "unset", matching the other optional keys.)
+   */
+  MAX_PROMPT_CHARS_PER_REQUEST: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.coerce.number().int().positive().optional(),
+  ),
+
   TASK_TOKEN_BUDGET: z.coerce.number().int().positive().default(200_000),
   LLM_MAX_TOKENS_PER_CALL: z.coerce.number().int().positive().default(8_192),
   LLM_MAX_PROMPT_TOKENS: z.coerce.number().int().positive().default(16_000),
@@ -174,6 +198,17 @@ const envSchema = z.object({
     .default("true"),
   DB_BACKUP_DIR: z.string().default("./data/backups"),
   DB_BACKUP_RETENTION_COUNT: z.coerce.number().int().positive().default(5),
+  /**
+   * Passphrase for at-rest database backups (issue #747). Scrypt-derived into
+   * an AES-256-GCM key; every backup is encrypted and paired with a checksum
+   * manifest. When unset the backup pipeline fails closed rather than writing
+   * plaintext — set it in every environment that takes backups.
+   * (An empty value in `.env` means "unset", matching the other optional keys.)
+   */
+  DB_BACKUP_ENCRYPTION_KEY: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.string().min(1).optional(),
+  ),
   DB_MAINTENANCE_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
   DB_MAINTENANCE_VACUUM_THRESHOLD: z.coerce.number().int().nonnegative().default(100),
   ERROR_REGISTRY_MAINTENANCE_INTERVAL_MS: z.coerce.number().int().positive().default(3_600_000),
@@ -347,6 +382,9 @@ function withRuntimeDefaults(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
           // path to createEventStore() instead.
           EVENT_STORE_PATH: ":memory:",
           VENICE_API_KEY: "test-venice-key",
+          // Deterministic key so backup round-trips are testable without ever
+          // falling back to plaintext backups (issue #747 fails closed).
+          DB_BACKUP_ENCRYPTION_KEY: "test-backup-encryption-key-0123456789",
           LOG_LEVEL: "silent",
           AUTH_JWT_SECRET: TEST_FALLBACK_JWT_SECRET,
         }

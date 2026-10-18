@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '../../utils/logger.js';
-import { CircuitBreaker } from './circuitBreaker.js';
+import { CircuitBreaker, type CircuitMetrics, type CircuitState, type CircuitTransition } from './circuitBreaker.js';
 import { trackCircuitBreaker } from '../circuitBreaker.js';
 import { CircuitOpenError, TokenBudgetExceededError, VeniceStatusError } from './errors.js';
 import { VeniceResponseCache, buildCacheKey } from './cache.js';
@@ -164,7 +164,7 @@ export class VeniceClient implements VeniceClientLike {
   }
 
   constructor(config: VeniceClientConfig) {
-    this.breaker = config.circuitBreaker ?? new CircuitBreaker({ name: 'venice' });
+    this.breaker = config.circuitBreaker ?? this.createBreaker(config);
     // Expose this breaker to `/health/deep`; untracked again in dispose().
     this.circuitUnsubscribers.push(trackCircuitBreaker(this.breaker));
 
@@ -451,66 +451,80 @@ export class VeniceClient implements VeniceClientLike {
     };
 
     try {
-      this.breaker.assertClosed();
-    } catch (e) {
-      if (this.enableCacheFallback && !options?.force) {
-        const stale = this.cache.getStale(promptForLogging, agentType, this.modelVersion);
-        if (stale !== null) {
-          log.warn({ agentType, model, circuitState: this.breaker.getState() }, 'venice circuit open — serving stale cache');
-          // A cache read costs no upstream tokens; report zero so the ledger
-          // does not charge the task for a lookup.
-          this.reportUsage(options, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
-          return stale;
+      try {
+        this.breaker.assertClosed();
+        probeHeld = true;
+      } catch (e) {
+        if (this.enableCacheFallback && !options?.force) {
+          const stale = this.cache.getStale(promptForLogging, agentType, this.modelVersion);
+          if (stale !== null) {
+            log.warn({ agentType, model, circuitState: this.breaker.getState() }, 'venice circuit open — serving stale cache');
+            // A cache read costs no upstream tokens; report zero so the ledger
+            // does not charge the task for a lookup.
+            this.reportUsage(options, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+            return stale;
+          }
         }
+        // No stale entry to fall back on: the open circuit must still shed
+        // the call rather than let it through.
         throw e;
       }
 
       const force = options?.force === true;
       const cacheKey = buildCacheKey(promptForLogging, agentType, this.modelVersion);
 
-    if (!force) {
-      const cached = this.cache.get(promptForLogging, agentType, this.modelVersion);
-      if (cached !== null) {
-        log.info(
-          { agentType, model, modelVersion: this.modelVersion, hitRate: this.cache.getHitRate() },
-          'venice cache hit',
-        );
-        this.reportUsage(options, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
-        return cached;
+      if (!force) {
+        const cached = this.cache.get(promptForLogging, agentType, this.modelVersion);
+        if (cached !== null) {
+          log.info(
+            { agentType, model, modelVersion: this.modelVersion, hitRate: this.cache.getHitRate() },
+            'venice cache hit',
+          );
+          this.reportUsage(options, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+          return cached;
+        }
       }
 
-    const runFetch = (): Promise<FetchOutcome> =>
-      this.runVeniceFetch({ messages, model, options, maxTokens, promptForLogging, agentType });
+      const runFetch = (): Promise<FetchOutcome> =>
+        this.runVeniceFetch({ messages, model, options, maxTokens, promptForLogging, agentType, settleSuccess, settleFailure });
 
-    let outcome: FetchOutcome;
-    try {
-      outcome = force ? await runFetch() : await this.deduplicator.dedup(cacheKey, runFetch);
-    } catch (err) {
-      // Graceful degradation: if all providers failed and we have stale cache, return it
-      if (this.enableCacheFallback && !force) {
-        const stale = this.cache.getStale(promptForLogging, agentType, this.modelVersion);
-        if (stale !== null) {
-          log.warn(
-            { agentType, model, error: err instanceof Error ? err.message : String(err) },
-            'venice all providers failed — serving stale cache (graceful degradation)',
-          );
-          // We *tried* to spend here, so estimate rather than reporting zero:
-          // the failed attempt did consume provider compute.
-          this.reportUsage(options, estimateUsage(promptForLogging, ''));
-          return stale;
+      let outcome: FetchOutcome;
+      try {
+        outcome = force ? await runFetch() : await this.deduplicator.dedup(cacheKey, runFetch);
+      } catch (err) {
+        // Graceful degradation: if all providers failed and we have stale cache, return it
+        if (this.enableCacheFallback && !force) {
+          const stale = this.cache.getStale(promptForLogging, agentType, this.modelVersion);
+          if (stale !== null) {
+            log.warn(
+              { agentType, model, error: err instanceof Error ? err.message : String(err) },
+              'venice all providers failed — serving stale cache (graceful degradation)',
+            );
+            // We *tried* to spend here, so estimate rather than reporting zero:
+            // the failed attempt did consume provider compute.
+            this.reportUsage(options, estimateUsage(promptForLogging, ''));
+            return stale;
+          }
         }
         throw err;
       }
 
-    // Report here rather than inside runVeniceFetch: the deduplicator shares
-    // one promise across concurrent identical requests, and each caller passed
-    // its own onUsage callback and budget context.
-    this.reportUsage(options, outcome.usage);
+      // Report here rather than inside runVeniceFetch: the deduplicator shares
+      // one promise across concurrent identical requests, and each caller passed
+      // its own onUsage callback and budget context.
+      this.reportUsage(options, outcome.usage);
 
-    if (!force) {
-      this.cache.set(promptForLogging, agentType, this.modelVersion, outcome.content);
+      if (!force) {
+        this.cache.set(promptForLogging, agentType, this.modelVersion, outcome.content);
+      }
+      return outcome.content;
+    } finally {
+      // Give back a HALF_OPEN probe slot the call never used. Harmless when the
+      // slot was already settled — the breaker floors the counter at zero.
+      if (probeHeld && !settled) {
+        this.breaker.release();
+      }
     }
-    return outcome.content;
   }
 
   /** Fire the caller's usage callback, if any. Never throws into the caller. */
@@ -542,6 +556,10 @@ export class VeniceClient implements VeniceClientLike {
     maxTokens: number;
     promptForLogging: string;
     agentType: string;
+    /** Records a success with the breaker (idempotent per call). */
+    settleSuccess: () => void;
+    /** Records a failure with the breaker (idempotent per call). */
+    settleFailure: () => void;
   }): Promise<FetchOutcome> {
     const requestId = randomUUID();
     const start = Date.now();
@@ -578,7 +596,7 @@ export class VeniceClient implements VeniceClientLike {
         // anything.
         const usage = parseUsage(data) ?? estimateUsage(promptForLogging, content);
 
-        this.breaker.recordSuccess();
+        settleSuccess();
         this.logRequest(requestId, agentType, model, promptForLogging, Date.now() - start, 'ok', retries, provider.name, usage);
         return { content, usage };
       } catch (err) {
@@ -672,12 +690,13 @@ export class VeniceClient implements VeniceClientLike {
     let delivered = 0;
     let lastError: Error | undefined;
 
-    for (let pIndex = 0; pIndex < this.providers.length; pIndex++) {
-      const provider = this.providers[pIndex]!;
-      // Per-attempt buffer. Reset up front so no state leaks between providers.
-      let accumulated = '';
-      const deltas: string[] = [];
-      try {
+    try {
+      for (let pIndex = 0; pIndex < this.providers.length; pIndex++) {
+        const provider = this.providers[pIndex]!;
+        // Per-attempt buffer. Reset up front so no state leaks between providers.
+        let accumulated = '';
+        const deltas: string[] = [];
+        try {
         const response = await this.fetchWithRetryForProvider(body, provider, () => { retries++; });
 
           if (!response.body) {
@@ -740,6 +759,17 @@ export class VeniceClient implements VeniceClientLike {
                   accumulated += delta;
                   deltas.push(delta);
                 }
+              } catch (err) {
+                parseFailures += 1;
+                log.warn(
+                  {
+                    error: err instanceof Error ? err.message : String(err),
+                    agentType,
+                    model,
+                    payloadPreview: payload.slice(0, 200),
+                  },
+                  'venice SSE frame failed to parse — frame dropped'
+                );
               }
             }
           }
@@ -771,7 +801,7 @@ export class VeniceClient implements VeniceClientLike {
         for (const delta of deltas) onChunk(delta);
         delivered = accumulated.length;
 
-        this.breaker.recordSuccess();
+        settleSuccess();
         // SSE frames only carry deltas, so there is no provider usage block to
         // read. Estimate from the prompt and everything we actually received;
         // the completion side is exact because we buffered it.
@@ -794,11 +824,12 @@ export class VeniceClient implements VeniceClientLike {
           await this.sleep(100);
           continue;
         }
-        this.breaker.recordFailure();
+        settleFailure();
         this.logRequest(requestId, agentType, model, prompt, Date.now() - start, 'error', retries, provider.name);
         throw new Error(
           `Venice stream error after ${delivered} characters delivered: ${lastError.message}`
         );
+      }
       }
 
       settleFailure();
